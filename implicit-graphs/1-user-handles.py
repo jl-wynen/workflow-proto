@@ -207,36 +207,59 @@ def neg(a: T) -> T:
     return -a
 
 
-def main() -> None:
-    # a = parameter("a", 1)
-    # b = parameter("b", 2)
-    # c = add(a, b)
-    # c.name = "c"
-    # d = neg(c)
-    # d.name = "d"
-    # print(c)
-    # print(d)
-    # print(a._graph.report())
-    # # del c  # this makes the graph not cache the value of c
-    #
-    # print(d.compute())
-    # print(d)
-    # print(a._graph.report())
-    #
-    # del c  # removes cached value
-    # print(a._graph.report())
-    #
-    # del b  # does not remove cached value
-    # print(a._graph.report())
-
+def example2() -> None:
+    # graph with anonymous intermediate + use node multiple times
     a = parameter("a", 1)
     b = parameter("b", 3)
     c = add(a, sub(b, a))
     c.name = "c"
-    print(a._graph.report())
+    print("before computation:", a._graph.report())
     c.compute()
-    print(a._graph.report())
+    print("after computation: ", a._graph.report())
     assert c.get() == b.get()
+
+    # get a handle to the intermediate node (d)
+    g = c._graph
+    (p,) = g.parents_of(c.id)
+    p = g._propagators[p]
+    x = [g.acquire(i) for i in g.parents_of(p.id)]
+    aa, d = x
+    print("aa: ", aa)
+    print("d: ", d)
+    print(g.report())
+
+    # recompute the content of d
+    d.compute()
+    print("d =", d.get())
+
+
+def example1() -> None:
+    # 2-layer graph
+    # a handle for every node
+    a = parameter("a", 1)
+    b = parameter("b", 2)
+    c = add(a, b)
+    c.name = "c"
+    d = neg(c)
+    d.name = "d"
+    print("c: ", c)
+    print("d: ", d)
+    print("before computation: ", a._graph.report())
+    # del c  # this makes the graph not cache the value of c
+
+    d.compute()
+    print("after computation: ", a._graph.report())
+    print("d: ", d)
+
+    del c  # removes cached value
+    print("after removing handle of c: ", a._graph.report())
+
+    del b  # does not remove cached value because b is a parameter
+    print("after removing handle of b: ", a._graph.report())
+
+
+def main() -> None:
+    example1()
 
 
 if __name__ == "__main__":
