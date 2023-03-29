@@ -1,5 +1,11 @@
 """
 Extend pp.Node to be a dask collection.
+
+Using the 'distributed' scheduler, I get
+TypeError: ('Could not serialize object of type function', '<function input_node.<locals>.<lambda> at 0x7f1358bfe5e0>')
+
+Using the 'processes' scheduler, I get
+TypeError: cannot pickle 'scipp._scipp.core.Variable' object
 """
 
 from itertools import chain
@@ -17,15 +23,15 @@ class CollectionNode(pp.Node):
         task_graph = {}
         pending = [self]
         while pending:
-            node = pending.pop(0)
+            node: CollectionNode = pending.pop(0)
             # Using {name: n.id for name, n in node.kwparents.items()}
             # as kwargs in the task spec with apply would treat n.id as a literal string
             # and not as a task key.
-            task_graph[node.id] = (
+            task_graph[node._combined_key()] = (
                 apply,
                 node.func,
-                [n.id for n in node.parents],
-                (dict, [[name, n.id] for name, n in node.kwparents.items()]),
+                [n._combined_key() for n in node.parents],
+                (dict, [[name, n._combined_key()] for name, n in node.kwparents.items()]),
             )
             # We could store the data of input nodes directly in the task graph
             # instead of adding the nodes as a separate task. But this requires
@@ -36,8 +42,11 @@ class CollectionNode(pp.Node):
         return task_graph
 
     def __dask_keys__(self):
-        # Is this correct?
-        return [self.id]
+        # Same as dask.Delayed
+        return [f'{self.name}-{self.id}']
+
+    def _combined_key(self):
+        return ''.join(self.__dask_keys__())
 
     @staticmethod
     def __dask_optimize__(dsk, keys, **kwargs):
@@ -52,14 +61,15 @@ class CollectionNode(pp.Node):
     __dask_scheduler__ = staticmethod(dask.threaded.get)
 
     def __dask_tokenize__(self):
-        # Or should this be the hash of the result?
+        # Every time we make a node, it gets a new id.
+        # So this is enough to uniquely identify the collection.
+        # This would break if nodes were copied and assigned a different function
+        # or different parents.
         return self.id
 
     def compute(self, scheduler=None, optimize_graph=False, **kwargs):
-        # Should check dask's global scheduler first.
-        if scheduler is None:
-            scheduler = CollectionNode.__dask_scheduler__
-        return scheduler(self.__dask_graph__(), self.id, **kwargs)
+        scheduler = dask.base.get_scheduler(scheduler=scheduler, collections=(self,))
+        return scheduler(self.__dask_graph__(), self._combined_key(), **kwargs)
 
     def persist(self, **kwargs):
         raise NotImplementedError("Persist not implemented for CollectionNode")
@@ -92,6 +102,9 @@ def mul(a, b):
 
 
 def main() -> None:
+    # Set the scheduler, this one is the default.
+    dask.config.set(scheduler='threading')
+
     a = sc.scalar(2)
     b = sc.scalar(3)
 
