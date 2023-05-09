@@ -3,19 +3,20 @@ from __future__ import annotations
 import inspect
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Callable, Generator
-
+from typing import Any, Callable, Generator, Literal, Protocol
+import uuid
+from dask.utils import apply as dask_apply
+import dask
 from rich import print
+from itertools import chain
 
-# TODO macros: callables need to be expanded early to produce full graph
-#  cannot merge those args into params
 
 """
     @node(params=("p1", "p2"))
     def foo(a, p1, b="x", p2="y"): ...
 
     foo(a=a_node)
-    foo.set_params({"p1": "p"})
+    foo.build({"p1": "p"})
 
 Arg types:
  - a: parent
@@ -24,7 +25,7 @@ Arg types:
  - p2: optional parameter
  
 Parents and given args must be specified in call to foo.
-(Optional) parameters must be specified in set_params.
+(Optional) parameters must be specified in build.
 """
 
 
@@ -123,10 +124,33 @@ def classify_args(
     )
 
 
+class Program(Protocol):
+    def compute(self) -> Any:
+        ...
+
+
+class DaskProgram:
+    def __init__(self, task_graph: dict, root_name: str) -> None:
+        self._task_graph = task_graph
+        self._root_name = root_name
+
+    def compute(self) -> Any:
+        return dask.get(self._task_graph, self._root_name)
+
+
 class Node:
     def __init__(
-        self, func: Callable, func_kwargs: dict[str, Any], params: tuple[str]
+        self,
+        func: Callable,
+        *,
+        name: str | None = None,
+        func_kwargs: dict[str, Any],
+        params: tuple[str],
     ) -> None:
+        self._name = name if name is not None else func.__name__
+        self._id = None
+        self._set_new_id()
+
         self._func = func
         args = classify_args(
             func, given_args=func_kwargs, designated_params=set(params)
@@ -137,36 +161,88 @@ class Node:
         self._params = args.params
         self._optional = args.optional
 
+    def clone(self) -> Node:
+        clone = deepcopy(self)
+        for node in clone._depth_first():
+            node._set_new_id()
+        return clone
+
+    def _set_new_id(self) -> None:
+        self._id = self._name + "-" + uuid.uuid4().hex
+
+    def _depth_first(self) -> Generator[Node, None, None]:
+        pending = [self]
+        visited = set()
+        while pending:
+            node = pending.pop(0)
+            if node._id in visited:
+                raise RuntimeError("Not a tree")
+            visited.add(node._id)
+            yield node
+            pending.extend(node._parents.values())
+
+    def _depth_first_with_params(
+        self, params: dict
+    ) -> Generator[(Node, dict), None, None]:
+        pending = [(self, params)]
+        visited = set()
+        while pending:
+            node, params = pending.pop(0)
+            if node._id in visited:
+                raise RuntimeError("Not a tree")
+            visited.add(node._id)
+            yield node, {k: v for k, v in params.items() if k not in node._parents}
+            pending.extend(
+                (parent, params.get(name, {})) for name, parent in node._parents.items()
+            )
+
     def set_param(self, name: str, value: Any) -> None:
         self._params[name] = value
-
-    def compute(self):
-        print("Computing", self._func.__name__)
-        assert not set(
-            self._param_names - self._params.keys() - self._optional
-        ), "Not all params are set"
-        return self._func(
-            **self._params,
-            **self._args,
-            **{k: p.compute() for k, p in self._parents.items()},
-        )
 
     @property
     def parents(self) -> Generator[tuple[str, Node], None, None]:
         yield from self._parents.items()
 
-    def build(self, params: dict[str, Any]) -> None:
-        for name, param in params.items():
-            if name in self._parents:
-                self._parents[name].build(param)
-            else:
-                self._params[name] = param
+    def build(self, params: dict[str, Any], engine: Literal["dask"]) -> Program:
+        if engine == "dask":
+            return self.build_dask(params)
+        raise NotImplementedError(f"Engine {engine} not implemented")
+
+    def build_dask(self, params: dict[str, Any]) -> DaskProgram:
+        # Using node._parent_id_dict.items()
+        # as kwargs in the task spec with apply would treat n.id as a literal string
+        # and not as a task key.
+        # We need to use (dict, [[k, v], ...]) instead, where the inner structure must
+        # be a list of lists; tuples don't work.
+
+        task_graph = {}
+        for node, params in self._depth_first_with_params(params):
+            task_graph[node._id] = (
+                dask_apply,
+                node._func,
+                (),
+                (
+                    dict,
+                    [
+                        [k, v]
+                        for k, v in chain(
+                            params.items(),
+                            node._args.items(),
+                            node._parent_id_dict().items(),
+                        )
+                    ],
+                ),
+            )
+        return DaskProgram(task_graph=task_graph, root_name=self._id)
+
+    def _parent_id_dict(self) -> dict[str, str]:
+        return {name: parent._id for name, parent in self._parents.items()}
 
 
-def node(params: tuple[str, ...] = ()):
+def node(*, name: str | None = None, params: tuple[str, ...] = ()):
     def decorator(func: Callable) -> Callable:
         def node_constructor(**kwargs):
-            return Node(func=func, func_kwargs=kwargs, params=params)
+            return Node(name=name, func=func, func_kwargs=kwargs, params=params)
 
         node_constructor.__name__ = func.__name__
         node_constructor.__node_wrapped__ = func
@@ -228,14 +304,16 @@ def main() -> None:
     sample = preprocess(
         data=load_nexus(), get_monitor=get_monitor_attr
     )  # default normalize
-    vana = deepcopy(sample)
+    vana = sample.clone()
     workflow = reduce(sample_data=sample, vana_data=vana, normalize=divide)
     params = {
         "sample_data": {"data": {"filename": "sample_file.nxs"}},
         "vana_data": {"data": {"filename": "vana_file.nxs"}, "fudge": 0.9},
     }
-    workflow.build(params)
-    print(workflow.compute())
+
+    graph = workflow.build(params, engine="dask")
+    # print(graph._task_graph)
+    print("result:  ", graph.compute())
 
     s = len("sample_file.nxs") / (len("sample_file.nxs") - 4)
     v = len("vana_file.nxs") / (len("vana_file.nxs") - 4) * 0.9
