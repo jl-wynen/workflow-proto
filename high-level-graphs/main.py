@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 from copy import deepcopy
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Callable, Generator, Literal, Protocol
 import uuid
 from dask.utils import apply as dask_apply
@@ -76,6 +77,15 @@ def validate_args(
         designated_params=designated_params,
     )
 
+def get_optional_args(argspec: inspect.FullArgSpec) -> dict[str, Any]:
+    if argspec.defaults:
+        optional = dict(zip(argspec.args[-len(argspec.defaults) :], argspec.defaults))
+    else:
+        optional = {}
+    if argspec.kwonlydefaults:
+        optional.update(argspec.kwonlydefaults)
+    return optional
+
 
 @dataclass()
 class NodeArgs:
@@ -83,7 +93,7 @@ class NodeArgs:
     args: dict[str, Any]
     param_names: set[str]
     params: dict[str, Any]
-    optional: set[str]
+    optional_params: dict[str, Any]
 
 
 def classify_args(
@@ -92,13 +102,14 @@ def classify_args(
     func = getattr(func, "__node_wrapped__", func)
 
     argspec = inspect.getfullargspec(func)
+    assert argspec.varargs is None and argspec.varkw is None
 
     args = tuple(argspec.args + argspec.kwonlyargs)
     optional = get_optional_args(argspec)
     validate_args(
         func.__name__,
         args=args,
-        optional=optional,
+        optional=set(optional),
         given_args=given_args,
         designated_params=designated_params,
     )
@@ -110,17 +121,18 @@ def classify_args(
     }
     other_given_args = {
         k: v
-        for k, v in given_args.items()
+        for k, v in chain(given_args.items(), optional.items())
         if not isinstance(v, Node) and k not in designated_params
     }
     params = {k: v for k, v in other_given_args.items() if k in designated_params}
+    optional_params = {k: v for k, v in optional.items() if k in designated_params}
 
     return NodeArgs(
         parents=parents,
         args=other_given_args,
         param_names=set(designated_params),
         params=params,
-        optional=optional,
+        optional_params=optional_params,
     )
 
 
@@ -159,7 +171,7 @@ class Node:
         self._args = args.args
         self._param_names = args.param_names
         self._params = args.params
-        self._optional = args.optional
+        self._optional_params = args.optional_params
 
     def clone(self) -> Node:
         clone = deepcopy(self)
@@ -217,6 +229,12 @@ class Node:
 
         task_graph = {}
         for node, params in self._depth_first_with_params(params):
+            params = dict(params)
+            args = dict(node._args)
+            for name, arg in args.items():
+                if name in params:
+                    args[name] = partial(args[name], **params.pop(name))
+
             task_graph[node._id] = (
                 dask_apply,
                 node._func,
@@ -227,7 +245,7 @@ class Node:
                         [k, v]
                         for k, v in chain(
                             params.items(),
-                            node._args.items(),
+                            args.items(),
                             node._parent_id_dict().items(),
                         )
                     ],
@@ -266,6 +284,10 @@ def get_monitor_attr(data: Data) -> Data | None:
     return data.monitor
 
 
+def to_wavelength(data: Data, n: float)->Data:
+    return Data(x=1 / (n + data.x), monitor=data.monitor)
+
+
 @node(params=("filename",))
 def load_nexus(filename: str) -> Data:
     return Data(x=len(filename), monitor=Data(x=len(filename) - 4))
@@ -275,10 +297,12 @@ def load_nexus(filename: str) -> Data:
 def preprocess(
     data: Data,
     get_monitor: Callable[[Data], Data],
+    wavelength: Callable[[Data], Data] = to_wavelength,
     normalize: Callable[[Data, Data], Data] = divide,
     fudge: float | None = None,
 ) -> Data:
-    mon = get_monitor(data)
+    mon = wavelength(get_monitor(data))
+    data = wavelength(data)
     if fudge is not None:
         data = Data(x=data.x * fudge)
     return normalize(data, mon)
@@ -291,15 +315,6 @@ def reduce(
     return normalize(sample_data, vana_data)
 
 
-def get_optional_args(argspec: inspect.FullArgSpec) -> set[str]:
-    optional = (
-        set(argspec.args[-len(argspec.defaults) :]) if argspec.defaults else set()
-    )
-    if argspec.kwonlydefaults:
-        return optional | set(argspec.kwonlydefaults)
-    return optional
-
-
 def main() -> None:
     sample = preprocess(
         data=load_nexus(), get_monitor=get_monitor_attr
@@ -307,17 +322,32 @@ def main() -> None:
     vana = sample.clone()
     workflow = reduce(sample_data=sample, vana_data=vana, normalize=divide)
     params = {
-        "sample_data": {"data": {"filename": "sample_file.nxs"}},
-        "vana_data": {"data": {"filename": "vana_file.nxs"}, "fudge": 0.9},
+        "sample_data": {"data": {"filename": "sample_file.nxs"},
+                        "wavelength": {"n": 1}},
+        "vana_data": {"data": {"filename": "vana_file.nxs"}, "fudge": 0.9,
+                      "wavelength": {"n": 2}},
     }
 
     graph = workflow.build(params, engine="dask")
     # print(graph._task_graph)
     print("result:  ", graph.compute())
 
-    s = len("sample_file.nxs") / (len("sample_file.nxs") - 4)
-    v = len("vana_file.nxs") / (len("vana_file.nxs") - 4) * 0.9
-    print("expected:", s / v)
+    s = load_nexus()._func(params["sample_data"]["data"]["filename"])
+    m = get_monitor_attr(s)
+    s = to_wavelength(s, params["sample_data"]["wavelength"]["n"])
+    m = to_wavelength(m, params["sample_data"]["wavelength"]["n"])
+    s = divide(s, m)
+
+    v = load_nexus()._func(params["vana_data"]["data"]["filename"])
+    m = get_monitor_attr(v)
+    v = to_wavelength(v, params["vana_data"]["wavelength"]["n"])
+    v.x *= params["vana_data"]["fudge"]
+    m = to_wavelength(m, params["vana_data"]["wavelength"]["n"])
+    v = divide(v, m)
+
+    expected = divide(s, v)
+
+    print("expected:", expected)
 
 
 if __name__ == "__main__":
