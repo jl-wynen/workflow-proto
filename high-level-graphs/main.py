@@ -10,7 +10,7 @@ from dask.utils import apply as dask_apply
 import dask
 from rich import print
 from itertools import chain
-
+from pydantic import create_model, BaseModel
 
 """
     @node(params=("p1", "p2"))
@@ -30,12 +30,15 @@ Parents and given args must be specified in call to foo.
 """
 
 
+# TODO parents or children?!
+
+
 def reject_extra_args(
-    func_name: str,
-    *,
-    args: tuple[str],
-    given_args: dict[str, Any],
-    designated_params: set[str],
+        func_name: str,
+        *,
+        args: tuple[str],
+        given_args: dict[str, Any],
+        designated_params: set[str],
 ) -> None:
     for arg in given_args:
         if arg not in args:
@@ -46,12 +49,12 @@ def reject_extra_args(
 
 
 def expect_all_args_are_specified(
-    func_name: str,
-    *,
-    args: tuple[str],
-    optional: set[str],
-    given_args: dict[str, Any],
-    designated_params: set[str],
+        func_name: str,
+        *,
+        args: tuple[str],
+        optional: set[str],
+        given_args: dict[str, Any],
+        designated_params: set[str],
 ) -> None:
     for arg in args:
         if arg not in optional and arg not in given_args.keys() | designated_params:
@@ -59,12 +62,12 @@ def expect_all_args_are_specified(
 
 
 def validate_args(
-    func_name: str,
-    *,
-    args: tuple[str],
-    optional: set[str],
-    given_args: dict[str, Any],
-    designated_params: set[str],
+        func_name: str,
+        *,
+        args: tuple[str],
+        optional: set[str],
+        given_args: dict[str, Any],
+        designated_params: set[str],
 ) -> None:
     reject_extra_args(
         func_name, args=args, given_args=given_args, designated_params=designated_params
@@ -77,9 +80,10 @@ def validate_args(
         designated_params=designated_params,
     )
 
+
 def get_optional_args(argspec: inspect.FullArgSpec) -> dict[str, Any]:
     if argspec.defaults:
-        optional = dict(zip(argspec.args[-len(argspec.defaults) :], argspec.defaults))
+        optional = dict(zip(argspec.args[-len(argspec.defaults):], argspec.defaults))
     else:
         optional = {}
     if argspec.kwonlydefaults:
@@ -97,7 +101,7 @@ class NodeArgs:
 
 
 def classify_args(
-    func: Callable, *, given_args: dict[str, Any], designated_params: set[str]
+        func: Callable, *, given_args: dict[str, Any], designated_params: set[str]
 ) -> NodeArgs:
     func = getattr(func, "__node_wrapped__", func)
 
@@ -152,12 +156,12 @@ class DaskProgram:
 
 class Node:
     def __init__(
-        self,
-        func: Callable,
-        *,
-        name: str | None = None,
-        func_kwargs: dict[str, Any],
-        params: tuple[str],
+            self,
+            func: Callable,
+            *,
+            name: str | None = None,
+            func_kwargs: dict[str, Any],
+            params: tuple[str],
     ) -> None:
         self._name = name if name is not None else func.__name__
         self._id = None
@@ -194,7 +198,7 @@ class Node:
             pending.extend(node._parents.values())
 
     def _depth_first_with_params(
-        self, params: dict
+            self, params: dict
     ) -> Generator[(Node, dict), None, None]:
         pending = [(self, params)]
         visited = set()
@@ -207,6 +211,18 @@ class Node:
             pending.extend(
                 (parent, params.get(name, {})) for name, parent in node._parents.items()
             )
+
+    def build_param_model(self):
+        parent_params = {
+            name: params for name, parent in self._parents.items()
+            if (params := parent.build_param_model()) is not None
+        }
+        # TODO callables
+        # TODO types
+        # TODO optional, default args
+        params = {name: Any for name in self._param_names}
+        args = {name: (type_, ...) for name, type_ in chain(parent_params.items(), params.items())}
+        return create_model(self._name, **args)
 
     def set_param(self, name: str, value: Any) -> None:
         self._params[name] = value
@@ -244,10 +260,10 @@ class Node:
                     [
                         [k, v]
                         for k, v in chain(
-                            params.items(),
-                            args.items(),
-                            node._parent_id_dict().items(),
-                        )
+                        params.items(),
+                        args.items(),
+                        node._parent_id_dict().items(),
+                    )
                     ],
                 ),
             )
@@ -284,7 +300,7 @@ def get_monitor_attr(data: Data) -> Data | None:
     return data.monitor
 
 
-def to_wavelength(data: Data, n: float)->Data:
+def to_wavelength(data: Data, n: float) -> Data:
     return Data(x=1 / (n + data.x), monitor=data.monitor)
 
 
@@ -295,11 +311,11 @@ def load_nexus(filename: str) -> Data:
 
 @node(params=("fudge",))
 def preprocess(
-    data: Data,
-    get_monitor: Callable[[Data], Data],
-    wavelength: Callable[[Data], Data] = to_wavelength,
-    normalize: Callable[[Data, Data], Data] = divide,
-    fudge: float | None = None,
+        data: Data,
+        get_monitor: Callable[[Data], Data],
+        wavelength: Callable[[Data], Data] = to_wavelength,
+        normalize: Callable[[Data, Data], Data] = divide,
+        fudge: float | None = None,
 ) -> Data:
     mon = wavelength(get_monitor(data))
     data = wavelength(data)
@@ -310,9 +326,34 @@ def preprocess(
 
 @node()
 def reduce(
-    sample_data: Data, vana_data: Data, normalize: Callable[[Data, Data], Data]
+        sample_data: Data, vana_data: Data, normalize: Callable[[Data, Data], Data]
 ) -> Data:
     return normalize(sample_data, vana_data)
+
+
+def is_model(type_):
+    try:
+        return issubclass(type_, BaseModel)
+    except TypeError:
+        return False
+
+
+def format_params(model, known=None):
+    known = known or set()
+    known.add(model.__name__)
+
+    # TODO optional
+    fields = "\n".join(f"    {name}: {getattr(field.type_, '__name__', field.type_)}"
+                       for name, field in model.__fields__.items())
+    res = f"""class {model.__name__}(BaseModel):
+{fields}
+    """
+    sub = "\n\n".join(format_params(field.type_, known=known)
+                      for field in model.__fields__.values()
+                      if is_model(field.type_) and field.type_.__name__ not in known)
+    if sub:
+        res += "\n\n" + sub
+    return res
 
 
 def main() -> None:
@@ -321,10 +362,14 @@ def main() -> None:
     )  # default normalize
     vana = sample.clone()
     workflow = reduce(sample_data=sample, vana_data=vana, normalize=divide)
+    P = workflow.build_param_model()
+    print(format_params(P))
+
     params = {
         "sample_data": {"data": {"filename": "sample_file.nxs"},
                         "wavelength": {"n": 1}},
-        "vana_data": {"data": {"filename": "vana_file.nxs"}, "fudge": 0.9,
+        "vana_data": {"data": {"filename": "vana_file.nxs"},
+                      "fudge": 0.9,
                       "wavelength": {"n": 2}},
     }
 
